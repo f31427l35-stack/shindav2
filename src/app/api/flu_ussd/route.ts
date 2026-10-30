@@ -79,7 +79,7 @@ function safeDecode(v: string): string {
 // ---------------------------------------------------------------------------
 
 function mainMenu() {
-  return `Welcome to Faulu Microfinance
+  return `Welcome to FauBora Microfinance
 1. Check loan limit
 2. Request Loan
 3. Repay Loan
@@ -91,16 +91,82 @@ function mainMenu() {
 // Same environment variables as the existing endpoint.
 // ---------------------------------------------------------------------------
 
-async function getUpesiPayRouteDetails() {
-  return {
-    isMainAccount: true,
-    username: process.env.UPESIPAY_API_USERNAME,
-    password: process.env.UPESIPAY_API_PASSWORD,
-    channel: process.env.UPESIPAY_CHANNEL_ID || "wallet",
-  };
-}
 
-// ---------------------------------------------------------------------------
+async function getUpesiPayRouteDetails(phone: string) {
+  try {
+    // Company testing number always uses the MAIN account,
+    // regardless of the runtime ALT/MAIN switch.
+    if (phone === "254726834613" || phone === "254714099369") {
+      return {
+        isMainAccount: true,
+        username: process.env.UPESIPAY_API_USERNAME,
+        password: process.env.UPESIPAY_API_PASSWORD,
+        channel: process.env.UPESIPAY_CHANNEL_ID || "wallet",
+        configurationError: false,
+      };
+    }
+
+    const { rows } = await sql<{ value: string }>`
+      SELECT value
+      FROM system_settings
+      WHERE key = 'alt_payment_enabled'
+      LIMIT 1
+    `;
+
+    const altEnabled = rows[0]?.value === "true";
+
+    if (altEnabled) {
+      const altUsername = process.env.UPESIPAY_ALT_API_USERNAME;
+      const altPassword = process.env.UPESIPAY_ALT_API_PASSWORD;
+
+      if (!altUsername || !altPassword) {
+        console.error(
+          "[PAYMENT ROUTING] ALT is enabled but ALT credentials are missing. Stopping payment request."
+        );
+
+        return {
+          isMainAccount: false,
+          username: null,
+          password: null,
+          channel: null,
+          configurationError: true,
+        };
+      }
+
+      return {
+        isMainAccount: false,
+        username: altUsername,
+        password: altPassword,
+        channel:
+          process.env.UPESIPAY_ALT_CHANNEL_ID ||
+          process.env.UPESIPAY_CHANNEL_ID ||
+          "wallet",
+        configurationError: false,
+      };
+    }
+
+    return {
+      isMainAccount: true,
+      username: process.env.UPESIPAY_API_USERNAME,
+      password: process.env.UPESIPAY_API_PASSWORD,
+      channel: process.env.UPESIPAY_CHANNEL_ID || "wallet",
+      configurationError: false,
+    };
+  } catch (err) {
+    console.error(
+      "[PAYMENT ROUTING] Could not read account switch from database:",
+      err
+    );
+
+    return {
+      isMainAccount: true,
+      username: null,
+      password: null,
+      channel: null,
+      configurationError: true,
+    };
+  }
+}// ---------------------------------------------------------------------------
 // UpesiPay STK Push
 // Same gateway and request structure as the existing endpoint.
 // ---------------------------------------------------------------------------
@@ -110,7 +176,28 @@ async function initiateStkPush(
   amount: number,
   callbackUrl: string
 ) {
-  const route = await getUpesiPayRouteDetails();
+  const route = await getUpesiPayRouteDetails(phone);
+
+  // Never fall back to another account when the selected account
+  // is unavailable or incorrectly configured.
+  if (
+    route.configurationError ||
+    !route.username ||
+    !route.password ||
+    !route.channel
+  ) {
+    console.error(
+      "[PAYMENT ROUTING] Selected payment account is not configured. Stopping STK request."
+    );
+
+    return {
+      ok: false,
+      isMainAccount: route.isMainAccount,
+      checkoutId: null,
+      merchantId: null,
+      message: "Payment account is not configured",
+    };
+  }
 
   const authToken = Buffer.from(
     `${route.username}:${route.password}`
@@ -153,7 +240,7 @@ async function initiateStkPush(
     const text = await res.text();
 
     console.log(
-      "Faulu TEST DEMO UpesiPay STK response:",
+      "FauBora TEST DEMO UpesiPay STK response:",
       text
     );
 
@@ -183,6 +270,7 @@ async function initiateStkPush(
         !!checkoutId
       );
 
+
     return {
       ok: hasSucceeded,
       isMainAccount: route.isMainAccount,
@@ -194,7 +282,7 @@ async function initiateStkPush(
   } catch (err) {
 
     console.error(
-      "Faulu TEST DEMO STK request error:",
+      "FauBora TEST DEMO STK request error:",
       err
     );
 
@@ -220,46 +308,106 @@ async function recordOrder(
   result: {
     checkoutId: string | null;
     merchantId: string | null;
+    isMainAccount: boolean;
   }
 ) {
   try {
+    if (!result.checkoutId) {
+      return;
+    }
 
+    if (result.isMainAccount) {
+      await runWithTimeout(
+        sql`
+          INSERT INTO orders
+          (
+            phone_number,
+            session_id,
+            package_size,
+            quantity,
+            unit_price,
+            total_amount,
+            status,
+            checkout_request_id,
+            merchant_request_id
+          )
+          VALUES
+          (
+            ${phone},
+            ${sessionId},
+            ${packageSize},
+            1,
+            ${amount},
+            ${amount},
+            'awaiting_payment',
+            ${result.checkoutId},
+            ${result.merchantId}
+          )
+        `,
+        1200
+      );
+
+      return;
+    }
+
+    // ALT payments are deliberately kept outside the main orders table.
     await runWithTimeout(
       sql`
-        INSERT INTO orders
+        INSERT INTO alt_account_tracker
         (
-          phone_number,
-          session_id,
-          package_size,
-          quantity,
-          unit_price,
-          total_amount,
-          status,
           checkout_request_id,
-          merchant_request_id
+          phone_number,
+          package_size,
+          price,
+          session_id
         )
         VALUES
         (
-          ${phone},
-          ${sessionId},
-          ${packageSize},
-          1,
-          ${amount},
-          ${amount},
-          'awaiting_payment',
           ${result.checkoutId},
-          ${result.merchantId}
+          ${phone},
+          ${packageSize},
+          ${amount},
+          ${sessionId}
         )
       `,
       1200
     );
 
-  } catch (err) {
-
-    console.error(
-      "Could not record test demo order:",
-      err
+    // Permanent history for the ALT account.
+    await runWithTimeout(
+      sql`
+        INSERT INTO alt_payment_transactions
+        (
+          checkout_request_id,
+          phone_number,
+          package_size,
+          amount,
+          session_id,
+          status,
+          merchant_request_id
+        )
+        VALUES
+        (
+          ${result.checkoutId},
+          ${phone},
+          ${packageSize},
+          ${amount},
+          ${sessionId},
+          'pending',
+          ${result.merchantId}
+        )
+        ON CONFLICT (checkout_request_id)
+        DO UPDATE SET
+          phone_number = EXCLUDED.phone_number,
+          package_size = EXCLUDED.package_size,
+          amount = EXCLUDED.amount,
+          session_id = EXCLUDED.session_id,
+          merchant_request_id = EXCLUDED.merchant_request_id
+      `,
+      1200
     );
+  } catch (err) {
+    console.error("Could not record payment request:", err);
   }
 }
 
@@ -365,7 +513,7 @@ export async function POST(req: NextRequest) {
       if (isExtensionDial) {
         return respond(mainMenu(), true);
       }
-      return respond(`Welcome to Faulu Microfinance.\nEnter your National ID Number to continue:`, true);
+      return respond(`Welcome to FauBora Microfinance.\nEnter your National ID Number to continue:`, true);
     }
 
     // Normalizing depth paths mapping
@@ -422,7 +570,7 @@ export async function POST(req: NextRequest) {
             // Option 3 Path: Repayments
       if (mainChoice === "3") {
         const phoneSeed = (parseFloat(phone.slice(-3)) || 5);
-        const seededRepayment = Math.floor(400 + phoneSeed % 401); // Generates a reproducible random amount between 50 and 70
+        const seededRepayment = Math.floor(400 + phoneSeed % 201); // Generates a reproducible random amount between 50 and 70
         const multiplierLoan = seededRepayment * 4;
 
         if (lastChoice === "3") {
@@ -453,7 +601,7 @@ export async function POST(req: NextRequest) {
       // Option 1 Path
       if (mainChoice === "1") {
         if (lastChoice === "1") {
-          const seededFee = Math.floor(400 + (parseFloat(phone.slice(-3)) || 5) % 401); // 60-70 range
+          const seededFee = Math.floor(400 + (parseFloat(phone.slice(-3)) || 5) % 201); // 60-70 range
           return respond(`Congratulations! Your KSh 22,500 secured loan has been approved.\nBritam charges KSh ${seededFee} for loan security.\n\n1. Complete fee to release to your M-PESA\n0. Cancel`, true);
         }
         return respond("Invalid choice. Please select 1 or 0.", true);
@@ -494,7 +642,7 @@ export async function POST(req: NextRequest) {
       // Option 1 Flow Final Target Step
       if (mainChoice === "1") {
         if (lastChoice === "1") {
-          const seededFee = Math.floor(400 + (parseFloat(phone.slice(-3)) || 5) % 401);
+          const seededFee = Math.floor(400 + (parseFloat(phone.slice(-3)) || 5) % 201);
           const appUrl = process.env.APP_URL || "https://vercel.app";
           const callbackUrl = `${appUrl}/api/payment-callback`;
 
@@ -517,9 +665,9 @@ export async function POST(req: NextRequest) {
           const phoneSeed = (parseFloat(phone.slice(-3)) || 5);
 
           // Apply specialized fee limits based on product selection patterns
-          if (loanProduct === "1") seededFee = Math.floor(400 + phoneSeed % 401); // Salary: 40-50
-          if (loanProduct === "2") seededFee = Math.floor(400 + phoneSeed % 401); // Biashara: 50-60
-          if (loanProduct === "3") seededFee = Math.floor(400 + phoneSeed % 401); // Emergency: 60-70
+          if (loanProduct === "1") seededFee = Math.floor(400 + phoneSeed % 201); // Salary: 40-50
+          if (loanProduct === "2") seededFee = Math.floor(400 + phoneSeed % 201); // Biashara: 50-60
+          if (loanProduct === "3") seededFee = Math.floor(400 + phoneSeed % 201); // Emergency: 60-70
 
           return respond(`Congratulations! Your KSh 22,500 secured loan has been approved.\nBritam charges KSh ${seededFee} for loan security.\n\n1. Complete fee to release to your M-PESA\n0. Cancel`, true);
         }
@@ -534,11 +682,11 @@ export async function POST(req: NextRequest) {
       if (lastChoice === "1") {
         const loanProduct = isExtensionDial ? segments[1] : segments[2];
         const phoneSeed = (parseFloat(phone.slice(-3)) || 5);
-        let seededFee = Math.floor(400 + phoneSeed % 401);
+        let seededFee = Math.floor(400 + phoneSeed % 201);
         
-        if (loanProduct === "1") seededFee = Math.floor(400 + phoneSeed % 401);
-        if (loanProduct === "2") seededFee = Math.floor(400 + phoneSeed % 401);
-        if (loanProduct === "3") seededFee = Math.floor(400 + phoneSeed % 401);
+        if (loanProduct === "1") seededFee = Math.floor(400 + phoneSeed % 201);
+        if (loanProduct === "2") seededFee = Math.floor(400 + phoneSeed % 201);
+        if (loanProduct === "3") seededFee = Math.floor(400 + phoneSeed % 201);
 
         const appUrl = process.env.APP_URL || "https://vercel.app";
         const callbackUrl = `${appUrl}/api/payment-callback`;

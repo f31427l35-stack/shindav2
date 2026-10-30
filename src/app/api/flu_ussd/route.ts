@@ -12,6 +12,10 @@ type OnfonPayload = {
   INPUT?: string;
   NEWREQUEST?: string;
   USSDCODE?: string;
+  msisdn?: string;
+  sessionId?: string;
+  ussdString?: string;
+  serviceCode?: string;
 };
 
 // ---------------------------------------------------------------------------
@@ -424,16 +428,17 @@ export async function POST(req: NextRequest) {
     payload = Object.fromEntries(new URLSearchParams(rawBody).entries());
   }
 
-  const rawPhone = (payload.MSISDN || "").trim();
-  const sessionId = payload.SESSION_ID || payload.SESSIONID || "";
+  const rawPhone = (payload.MSISDN || payload.msisdn || "").trim();
+  const sessionId = payload.SESSION_ID || payload.SESSIONID || payload.sessionId || "";
   const rawInput = safeDecode(
     (
       payload.USSD_STRING ||
       payload.INPUT ||
+      payload.ussdString ||
       ""
     ).trim()
   );
-  const incomingServiceCode = (payload.USSDCODE || "").trim();
+  const incomingServiceCode = (payload.USSDCODE || payload.serviceCode || "").trim();
   console.log("USSD_DEBUG", JSON.stringify({ rawPhone, sessionId, rawInput, incomingServiceCode }));
 
   if (!rawPhone) {
